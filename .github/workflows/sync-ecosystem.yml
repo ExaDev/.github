@@ -31,7 +31,7 @@ jobs:
           for pkg in $SIBLING_PACKAGES; do
             version=$(npm view "$pkg" version)
             echo "Latest $pkg -> $version"
-            echo "latest_${pkg//./_}=${version}" >> "$GITHUB_OUTPUT"
+            echo "latest_${pkg//[.-]/_}=${version}" >> "$GITHUB_OUTPUT"
           done
       - name: Compare each consumer repo's declared versions and dispatch updates for anything stale
         env:
@@ -39,7 +39,7 @@ jobs:
         run: |
           declare -A latest_version
           for pkg in $SIBLING_PACKAGES; do
-            key="latest_${pkg//./_}"
+            key="latest_${pkg//[.-]/_}"
             latest_version["$pkg"]="${!key}"
           done
 

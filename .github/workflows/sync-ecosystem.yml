@@ -19,28 +19,32 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - name: Generate a token
+      # Scoped to every consumer repo explicitly: a token minted with no owner/repositories input is scoped only to the repo the workflow itself runs in (this repo), which cannot fire a repository_dispatch against any other ExaDev repo.
+      - name: Generate a token scoped to every consumer repo
         id: app-token
         uses: actions/create-github-app-token@v2
         with:
           app-id: "4473709"
           private-key: ${{ secrets.AUTOMERGE_APP_PRIVATE_KEY }}
-      - name: Look up latest published version of every sibling package
-        id: latest
-        run: |
-          for pkg in $SIBLING_PACKAGES; do
-            version=$(npm view "$pkg" version)
-            echo "Latest $pkg -> $version"
-            echo "latest_${pkg//[.-]/_}=${version}" >> "$GITHUB_OUTPUT"
-          done
-      - name: Compare each consumer repo's declared versions and dispatch updates for anything stale
+          owner: ExaDev
+          repositories: |
+            ooxml.js
+            odf.js
+            pdf-codec
+            markdown-codec
+            documents.js
+            document-cli
+            document-mcp
+            documents
+      # One step, not two: steps.<id>.outputs.* is only readable via the ${{ }} expression syntax at the YAML level, not as a plain shell variable in a later step's own process -- the associative array built here has to be populated and consumed in the same script.
+      - name: Compare every consumer repo's declared versions and dispatch updates for anything stale
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           declare -A latest_version
           for pkg in $SIBLING_PACKAGES; do
-            key="latest_${pkg//[.-]/_}"
-            latest_version["$pkg"]="${!key}"
+            latest_version["$pkg"]=$(npm view "$pkg" version)
+            echo "Latest $pkg -> ${latest_version[$pkg]}"
           done
 
           summary="$GITHUB_STEP_SUMMARY"

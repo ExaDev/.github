@@ -133,18 +133,11 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
 
-          candidates=$(gh pr list --state open --json number,headRefName \
-            --jq '[.[] | select(.headRefName | startswith("sibling-update/"))] | .[]')
-          if [ -z "$candidates" ]; then
-            echo "No open sibling-update PRs found."
-            exit 0
-          fi
+          # One PR's failure must never abort the rest of the batch -- this whole body previously ran under bash's default errexit (set -e, GitHub Actions' default for `run:` steps), so a single `gh pr create` failure (e.g. "a pull request for branch ... already exists", a genuine race against a concurrent dispatch or another heal-stranded-prs run touching the same branch) killed the entire step immediately, silently abandoning every other stranded PR still queued in this run. Confirmed happening in production on 2026-08-12 -- a real, growing backlog of 20+ stranded PRs accumulated across the family because every run died on the first conflict. regenerate_pr is called inside an `if`, which suppresses errexit for that call, so a nonzero return here only ends this one PR's processing, not the loop.
+          regenerate_pr() {
+            local number="$1" branch="$2"
 
-          echo "$candidates" | jq -c '.' | while read -r entry; do
-            number=$(echo "$entry" | jq -r '.number')
-            branch=$(echo "$entry" | jq -r '.headRefName')
-
-            mergeable="UNKNOWN"
+            local mergeable="UNKNOWN"
             for _attempt in $(seq 1 10); do
               mergeable=$(gh pr view "$number" --json mergeable --jq '.mergeable')
               if [ "$mergeable" != "UNKNOWN" ]; then
@@ -155,15 +148,15 @@ jobs:
 
             if [ "$mergeable" != "CONFLICTING" ]; then
               echo "PR #${number} (${branch}) is ${mergeable}, not stranded -- skipping."
-              continue
+              return 0
             fi
 
-            package_version="${branch#sibling-update/}"
-            package="${package_version%-*}"
-            version="${package_version##*-}"
+            local package_version="${branch#sibling-update/}"
+            local package="${package_version%-*}"
+            local version="${package_version##*-}"
             echo "Regenerating stranded PR #${number} (${branch}) for ${package}@${version}"
 
-            gh pr close "$number" --comment "Regenerating -- this branch fell behind main and could no longer auto-merge."
+            gh pr close "$number" --comment "Regenerating -- this branch fell behind main and could no longer auto-merge." || true
 
             git fetch origin main
             git checkout -B "$branch" origin/main
@@ -171,18 +164,33 @@ jobs:
 
             if git diff --quiet -- package.json pnpm-lock.yaml; then
               echo "main already has ${package}@${version} or newer -- nothing left to bump."
-              continue
+              return 0
             fi
 
             git add package.json pnpm-lock.yaml
             git commit -m "build(deps): bump ${package} to ${version}"
             git push --force origin "$branch"
-            pr_url=$(gh pr create --title "build(deps): bump ${package} to ${version}" \
+
+            local pr_url
+            if ! pr_url=$(gh pr create --title "build(deps): bump ${package} to ${version}" \
               --body "Regenerated automatically after the original PR fell behind main." \
-              --base main --head "$branch")
+              --base main --head "$branch" 2>&1); then
+              # A PR for this exact branch can already exist if a concurrent dispatch (a fresh publish, or another heal-stranded-prs run) recreated it between this loop reading its candidate list and this iteration reaching gh pr create. The push above already landed on the branch either way, so reuse whatever PR now points at it instead of treating this as fatal.
+              local existing
+              existing=$(gh pr list --state open --head "$branch" --json url --jq '.[0].url // empty')
+              if [ -z "$existing" ]; then
+                echo "::warning::gh pr create failed for ${branch} and no existing open PR was found: ${pr_url}"
+                return 1
+              fi
+              echo "PR for ${branch} already exists -- reusing ${existing} instead of creating a new one."
+              pr_url="$existing"
+            fi
+
+            local head_sha
             head_sha=$(git rev-parse HEAD)
 
             for _attempt in $(seq 1 30); do
+              local found
               found=$(gh api "repos/${{ github.repository }}/commits/${head_sha}/check-runs" \
                 --jq '[.check_runs[] | select(.name == "Test")] | length')
               if [ "$found" -gt 0 ]; then
@@ -192,16 +200,35 @@ jobs:
             done
 
             for _poll in $(seq 1 90); do
+              local _pending
               _pending=$(gh api "repos/${{ github.repository }}/commits/${head_sha}/check-runs" --paginate --jq '[.check_runs[] | select(.conclusion == null)] | length')
               if [ "$_pending" -eq 0 ]; then
+                local _failed
                 _failed=$(gh api "repos/${{ github.repository }}/commits/${head_sha}/check-runs" --paginate --jq '[.check_runs[] | select(.conclusion != "success" and .conclusion != "skipped")] | length')
                 if [ "$_failed" -gt 0 ]; then
                   echo "CI failed on regenerated PR -- leaving it open for review"
-                  break
+                  return 0
                 fi
-                gh pr merge --rebase "$pr_url"
-                break
+                gh pr merge --rebase "$pr_url" || echo "::warning::merge of ${pr_url} failed -- leaving it open for the next heal-stranded-prs run to retry"
+                return 0
               fi
+              echo "Waiting for ${_pending} CI check(s) to complete on ${branch}..."
               sleep 20
             done
+            echo "::warning::CI did not complete within 30 minutes for ${branch}. PR left open for manual merge or a later retry."
+          }
+
+          candidates=$(gh pr list --state open --json number,headRefName \
+            --jq '[.[] | select(.headRefName | startswith("sibling-update/"))] | .[]')
+          if [ -z "$candidates" ]; then
+            echo "No open sibling-update PRs found."
+            exit 0
+          fi
+
+          echo "$candidates" | jq -c '.' | while read -r entry; do
+            number=$(echo "$entry" | jq -r '.number')
+            branch=$(echo "$entry" | jq -r '.headRefName')
+            if ! regenerate_pr "$number" "$branch"; then
+              echo "::warning::Failed to regenerate PR #${number} (${branch}) -- continuing with the rest of the batch."
+            fi
           done

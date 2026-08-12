@@ -1,0 +1,73 @@
+name: Sync documents.js ecosystem dependencies
+
+# Manual entry point for "make sure every documents.js-family repo has every sibling dependency it depends on at the latest published version, right now" -- rather than waiting for each package's own publish-time repository_dispatch (see sibling-dependency-update.yml), or dispatching to repos one at a time by hand. For every consumer repo below, reads its package.json, compares each declared ExaDev-sibling dependency against that package's current npm "latest" version, and fires the same repository_dispatch event (type sibling-released) that a fresh publish would send for every dependency found stale. Each dispatch is handled by the receiving repo's own sibling-dependency-update.yml caller stub exactly as if the dependency had just published -- this workflow does no bumping, committing, or merging itself.
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  # Every ExaDev repo that both publishes to npm and is itself installable as a sibling dependency -- i.e. every documents.js-family package except the interface-only repos (document-cli, document-mcp, documents), which are never depended on by another repo in the family.
+  SIBLING_PACKAGES: "byte-codec document-schema.js ooxml.js odf.js pdf-codec markdown-codec documents.js"
+  # Every repo that might have a package.json dependency on one of the packages above.
+  CONSUMER_REPOS: "ooxml.js odf.js pdf-codec markdown-codec documents.js document-cli document-mcp documents"
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Generate a token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: "4473709"
+          private-key: ${{ secrets.AUTOMERGE_APP_PRIVATE_KEY }}
+      - name: Look up latest published version of every sibling package
+        id: latest
+        run: |
+          for pkg in $SIBLING_PACKAGES; do
+            version=$(npm view "$pkg" version)
+            echo "Latest $pkg -> $version"
+            echo "latest_${pkg//./_}=${version}" >> "$GITHUB_OUTPUT"
+          done
+      - name: Compare each consumer repo's declared versions and dispatch updates for anything stale
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          declare -A latest_version
+          for pkg in $SIBLING_PACKAGES; do
+            key="latest_${pkg//./_}"
+            latest_version["$pkg"]="${!key}"
+          done
+
+          summary="$GITHUB_STEP_SUMMARY"
+          {
+            echo "## Ecosystem dependency sync"
+            echo ""
+            echo "| Repo | Package | Declared | Latest | Action |"
+            echo "|------|---------|----------|--------|--------|"
+          } >> "$summary"
+
+          for repo in $CONSUMER_REPOS; do
+            package_json=$(gh api "repos/ExaDev/${repo}/contents/package.json" --jq '.content' | base64 -d)
+            for pkg in $SIBLING_PACKAGES; do
+              declared=$(echo "$package_json" | jq -r --arg pkg "$pkg" '(.dependencies // {}) * (.devDependencies // {}) * (.peerDependencies // {}) | .[$pkg] // empty' | sed -E 's/^[\^~]//')
+              if [ -z "$declared" ]; then
+                continue
+              fi
+              latest="${latest_version[$pkg]}"
+              if [ "$declared" == "$latest" ]; then
+                echo "| ${repo} | ${pkg} | ${declared} | ${latest} | up to date |" >> "$summary"
+                continue
+              fi
+              echo "${repo} depends on ${pkg}@${declared}, latest is ${latest} -- dispatching sibling-released"
+              gh api "repos/ExaDev/${repo}/dispatches" \
+                -f event_type=sibling-released \
+                -F "client_payload[package]=${pkg}" \
+                -F "client_payload[version]=${latest}"
+              echo "| ${repo} | ${pkg} | ${declared} | ${latest} | dispatched |" >> "$summary"
+            done
+          done

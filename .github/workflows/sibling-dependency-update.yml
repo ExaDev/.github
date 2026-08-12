@@ -1,0 +1,207 @@
+name: Sibling dependency instant update
+
+# Reusable workflow shared by every repo in the documents.js ecosystem (and any other ExaDev repo with sibling npm dependencies on ExaDev-published packages). A caller repo's own thin stub triggers this on repository_dispatch (sent by a sibling package's own CI the moment it publishes -- see that package's "Notify downstream repositories" job), on push to main (to heal any sibling-update PR that fell behind), and on workflow_dispatch (manual trigger, and the entry point sync-ecosystem.yml uses when firing a dispatch programmatically). A called reusable workflow receives the exact same github.event/github.event_name as its caller (GitHub Actions propagates the calling workflow's full event payload into workflow_call jobs), so github.event.client_payload and the event_name gates below behave identically to when this logic lived directly in each repo.
+#
+# The branch push and the PR-open call both authenticate via a freshly-minted GitHub App installation token, not the default GITHUB_TOKEN -- GITHUB_TOKEN-authenticated actions (a push OR opening a PR) do not cascade into further workflow runs, so a GITHUB_TOKEN-created PR would never trigger the caller repo's own CI pull_request checks at all, leaving nothing for the merge step below to wait on.
+#
+# Even with the App token making that cascade happen for real, GitHub can take a few seconds to register the caller repo's CI check-runs against the new PR's commit at all. The "wait for CI checks" step first polls until at least one check-run has appeared against the head commit, and only then starts polling for every check-run to reach a conclusion -- skipping that first wait would read an empty check-run list as "nothing pending, nothing failed" and merge before CI ever ran.
+#
+# This workflow never pushes directly to main -- the PR only merges once the caller repo's own required checks genuinely pass on it, and (when branch protection is configured with required status checks) GitHub itself refuses the merge until they do, independent of this script's own polling logic being correct.
+
+on:
+  workflow_call: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump-and-open-pr:
+    if: github.event_name == 'repository_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: pnpm
+      - name: Bump the released dependency
+        env:
+          PACKAGE: ${{ github.event.client_payload.package }}
+          VERSION: ${{ github.event.client_payload.version }}
+        run: pnpm add "$PACKAGE@$VERSION"
+      - name: Check whether anything actually changed
+        id: diff
+        run: |
+          if git diff --quiet -- package.json pnpm-lock.yaml; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Generate a token for the branch push and PR
+        if: steps.diff.outputs.changed == 'true'
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: "4473709"
+          private-key: ${{ secrets.AUTOMERGE_APP_PRIVATE_KEY }}
+      - name: Commit and open a PR
+        if: steps.diff.outputs.changed == 'true'
+        id: pr
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PACKAGE: ${{ github.event.client_payload.package }}
+          VERSION: ${{ github.event.client_payload.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          branch="sibling-update/${PACKAGE}-${VERSION}"
+          git checkout -b "$branch"
+          git add package.json pnpm-lock.yaml
+          body=$(printf 'Triggered instantly via repository_dispatch when %s published its own release,\nrather than waiting for the next scheduled Dependabot scan.' "$PACKAGE")
+          git commit -m "build(deps): bump ${PACKAGE} to ${VERSION}" -m "$body"
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          git push origin "$branch"
+          pr_url=$(gh pr create --title "build(deps): bump ${PACKAGE} to ${VERSION}" --body "Automatic dependency bump triggered instantly by the ${PACKAGE} release." --base main --head "$branch")
+          echo "pr_url=$pr_url" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Wait for a check-run to register against the new commit
+        if: steps.diff.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          head_sha="${{ steps.pr.outputs.head_sha }}"
+          repo="${{ github.repository }}"
+          for _attempt in $(seq 1 30); do
+            found=$(gh api "repos/${repo}/commits/${head_sha}/check-runs" --jq '[.check_runs[] | select(.name == "Test")] | length')
+            if [ "$found" -gt 0 ]; then
+              echo "Test check-run has registered."
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "::warning::No 'Test' check-run registered within 90 seconds. Proceeding to poll anyway -- the polling loop below still treats an empty check-run list as nothing-pending, so this is a best-effort guard, not a hard requirement."
+      - name: Wait for all CI checks to pass, then rebase-merge
+        if: steps.diff.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          pr_url="${{ steps.pr.outputs.pr_url }}"
+          head_sha="${{ steps.pr.outputs.head_sha }}"
+          repo="${{ github.repository }}"
+          for _attempt in $(seq 1 90); do
+            pending=$(gh api "repos/${repo}/commits/${head_sha}/check-runs" --paginate --jq '[.check_runs[] | select(.conclusion == null)] | length')
+            if [ "$pending" -eq 0 ]; then
+              failed=$(gh api "repos/${repo}/commits/${head_sha}/check-runs" --paginate --jq '[.check_runs[] | select(.conclusion != "success" and .conclusion != "skipped")] | length')
+              if [ "$failed" -gt 0 ]; then
+                echo "::error::CI checks failed on this sibling-update PR. Leaving it open for manual review."
+                exit 1
+              fi
+              echo "All CI checks passed. Rebase-merging."
+              gh pr merge --rebase "$pr_url"
+              exit 0
+            fi
+            echo "Waiting for ${pending} CI check(s) to complete..."
+            sleep 20
+          done
+          echo "::warning::CI did not complete within 30 minutes. PR left open for manual merge." >&2
+
+  heal-stranded-prs:
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: pnpm
+      - name: Generate a token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: "4473709"
+          private-key: ${{ secrets.AUTOMERGE_APP_PRIVATE_KEY }}
+      - name: Regenerate every conflicting sibling-update PR
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+
+          candidates=$(gh pr list --state open --json number,headRefName \
+            --jq '[.[] | select(.headRefName | startswith("sibling-update/"))] | .[]')
+          if [ -z "$candidates" ]; then
+            echo "No open sibling-update PRs found."
+            exit 0
+          fi
+
+          echo "$candidates" | jq -c '.' | while read -r entry; do
+            number=$(echo "$entry" | jq -r '.number')
+            branch=$(echo "$entry" | jq -r '.headRefName')
+
+            mergeable="UNKNOWN"
+            for _attempt in $(seq 1 10); do
+              mergeable=$(gh pr view "$number" --json mergeable --jq '.mergeable')
+              if [ "$mergeable" != "UNKNOWN" ]; then
+                break
+              fi
+              sleep 3
+            done
+
+            if [ "$mergeable" != "CONFLICTING" ]; then
+              echo "PR #${number} (${branch}) is ${mergeable}, not stranded -- skipping."
+              continue
+            fi
+
+            package_version="${branch#sibling-update/}"
+            package="${package_version%-*}"
+            version="${package_version##*-}"
+            echo "Regenerating stranded PR #${number} (${branch}) for ${package}@${version}"
+
+            gh pr close "$number" --comment "Regenerating -- this branch fell behind main and could no longer auto-merge."
+
+            git fetch origin main
+            git checkout -B "$branch" origin/main
+            pnpm add "${package}@${version}"
+
+            if git diff --quiet -- package.json pnpm-lock.yaml; then
+              echo "main already has ${package}@${version} or newer -- nothing left to bump."
+              continue
+            fi
+
+            git add package.json pnpm-lock.yaml
+            git commit -m "build(deps): bump ${package} to ${version}"
+            git push --force origin "$branch"
+            pr_url=$(gh pr create --title "build(deps): bump ${package} to ${version}" \
+              --body "Regenerated automatically after the original PR fell behind main." \
+              --base main --head "$branch")
+            head_sha=$(git rev-parse HEAD)
+
+            for _attempt in $(seq 1 30); do
+              found=$(gh api "repos/${{ github.repository }}/commits/${head_sha}/check-runs" \
+                --jq '[.check_runs[] | select(.name == "Test")] | length')
+              if [ "$found" -gt 0 ]; then
+                break
+              fi
+              sleep 3
+            done
+
+            for _poll in $(seq 1 90); do
+              _pending=$(gh api "repos/${{ github.repository }}/commits/${head_sha}/check-runs" --paginate --jq '[.check_runs[] | select(.conclusion == null)] | length')
+              if [ "$_pending" -eq 0 ]; then
+                _failed=$(gh api "repos/${{ github.repository }}/commits/${head_sha}/check-runs" --paginate --jq '[.check_runs[] | select(.conclusion != "success" and .conclusion != "skipped")] | length')
+                if [ "$_failed" -gt 0 ]; then
+                  echo "CI failed on regenerated PR -- leaving it open for review"
+                  break
+                fi
+                gh pr merge --rebase "$pr_url"
+                break
+              fi
+              sleep 20
+            done
+          done

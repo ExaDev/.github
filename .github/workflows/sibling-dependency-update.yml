@@ -134,20 +134,74 @@ jobs:
           git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
 
           # One PR's failure must never abort the rest of the batch -- this whole body previously ran under bash's default errexit (set -e, GitHub Actions' default for `run:` steps), so a single `gh pr create` failure (e.g. "a pull request for branch ... already exists", a genuine race against a concurrent dispatch or another heal-stranded-prs run touching the same branch) killed the entire step immediately, silently abandoning every other stranded PR still queued in this run. Confirmed happening in production on 2026-08-12 -- a real, growing backlog of 20+ stranded PRs accumulated across the family because every run died on the first conflict. regenerate_pr is called inside an `if`, which suppresses errexit for that call, so a nonzero return here only ends this one PR's processing, not the loop.
+          #
+          # Shared by both healing paths below: waits for a check-run to register against head_sha, then polls until every check-run concludes, then rebase-merges pr_url if they all passed.
+          wait_and_merge() {
+            local pr_url="$1" head_sha="$2" branch="$3"
+
+            for _attempt in $(seq 1 30); do
+              local found
+              found=$(gh api "repos/${{ github.repository }}/commits/${head_sha}/check-runs" \
+                --jq '[.check_runs[] | select(.name == "Test")] | length')
+              if [ "$found" -gt 0 ]; then
+                break
+              fi
+              sleep 3
+            done
+
+            for _poll in $(seq 1 90); do
+              local _pending
+              _pending=$(gh api "repos/${{ github.repository }}/commits/${head_sha}/check-runs" --paginate --jq '[.check_runs[] | select(.conclusion == null)] | length')
+              if [ "$_pending" -eq 0 ]; then
+                local _failed
+                _failed=$(gh api "repos/${{ github.repository }}/commits/${head_sha}/check-runs" --paginate --jq '[.check_runs[] | select(.conclusion != "success" and .conclusion != "skipped")] | length')
+                if [ "$_failed" -gt 0 ]; then
+                  echo "CI failed on ${branch} -- leaving it open for review"
+                  return 0
+                fi
+                gh pr merge --rebase "$pr_url" || echo "::warning::merge of ${pr_url} failed -- leaving it open for the next heal-stranded-prs run to retry"
+                return 0
+              fi
+              echo "Waiting for ${_pending} CI check(s) to complete on ${branch}..."
+              sleep 20
+            done
+            echo "::warning::CI did not complete within 30 minutes for ${branch}. PR left open for manual merge or a later retry."
+          }
+
           regenerate_pr() {
             local number="$1" branch="$2"
 
-            local mergeable="UNKNOWN"
+            local mergeable="UNKNOWN" merge_state="unknown"
             for _attempt in $(seq 1 10); do
               mergeable=$(gh pr view "$number" --json mergeable --jq '.mergeable')
+              merge_state=$(gh pr view "$number" --json mergeStateStatus --jq '.mergeStateStatus')
               if [ "$mergeable" != "UNKNOWN" ]; then
                 break
               fi
               sleep 3
             done
 
+            # A PR whose branch is merely behind main (no real conflict -- required-status-checks' own "strict" mode just needs a fresh commit re-tested against the current base) never becomes CONFLICTING and so was previously invisible to this job entirely, left to sit open indefinitely with nothing watching it once the bump-and-open-pr run that created it already exited. Confirmed in production on 2026-08-12: under a sustained burst of pushes, several sibling-update PRs' own original merge-wait loop lost the race against main moving again and gave up, and nothing ever retried them since heal-stranded-prs only looked for CONFLICTING. A plain branch update (no close/regenerate) is enough here -- the content is already correct, it just needs re-validating against the new base.
+            if [ "$mergeable" = "MERGEABLE" ] && [ "$merge_state" = "BEHIND" ]; then
+              echo "PR #${number} (${branch}) is mergeable but behind main -- updating the branch instead of regenerating."
+              gh api --method PUT "repos/${{ github.repository }}/pulls/${number}/update-branch" >/dev/null
+              local pr_url head_sha
+              pr_url=$(gh pr view "$number" --json url --jq '.url')
+              for _attempt in $(seq 1 20); do
+                local current_state
+                current_state=$(gh pr view "$number" --json mergeStateStatus --jq '.mergeStateStatus')
+                if [ "$current_state" != "BEHIND" ]; then
+                  break
+                fi
+                sleep 5
+              done
+              head_sha=$(gh pr view "$number" --json headRefOid --jq '.headRefOid')
+              wait_and_merge "$pr_url" "$head_sha" "$branch"
+              return 0
+            fi
+
             if [ "$mergeable" != "CONFLICTING" ]; then
-              echo "PR #${number} (${branch}) is ${mergeable}, not stranded -- skipping."
+              echo "PR #${number} (${branch}) is ${mergeable}/${merge_state}, not stranded -- skipping."
               return 0
             fi
 
@@ -188,34 +242,7 @@ jobs:
 
             local head_sha
             head_sha=$(git rev-parse HEAD)
-
-            for _attempt in $(seq 1 30); do
-              local found
-              found=$(gh api "repos/${{ github.repository }}/commits/${head_sha}/check-runs" \
-                --jq '[.check_runs[] | select(.name == "Test")] | length')
-              if [ "$found" -gt 0 ]; then
-                break
-              fi
-              sleep 3
-            done
-
-            for _poll in $(seq 1 90); do
-              local _pending
-              _pending=$(gh api "repos/${{ github.repository }}/commits/${head_sha}/check-runs" --paginate --jq '[.check_runs[] | select(.conclusion == null)] | length')
-              if [ "$_pending" -eq 0 ]; then
-                local _failed
-                _failed=$(gh api "repos/${{ github.repository }}/commits/${head_sha}/check-runs" --paginate --jq '[.check_runs[] | select(.conclusion != "success" and .conclusion != "skipped")] | length')
-                if [ "$_failed" -gt 0 ]; then
-                  echo "CI failed on regenerated PR -- leaving it open for review"
-                  return 0
-                fi
-                gh pr merge --rebase "$pr_url" || echo "::warning::merge of ${pr_url} failed -- leaving it open for the next heal-stranded-prs run to retry"
-                return 0
-              fi
-              echo "Waiting for ${_pending} CI check(s) to complete on ${branch}..."
-              sleep 20
-            done
-            echo "::warning::CI did not complete within 30 minutes for ${branch}. PR left open for manual merge or a later retry."
+            wait_and_merge "$pr_url" "$head_sha" "$branch"
           }
 
           candidates=$(gh pr list --state open --json number,headRefName \

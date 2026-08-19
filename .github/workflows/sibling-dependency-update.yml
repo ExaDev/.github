@@ -6,6 +6,8 @@ name: Sibling dependency instant update
 #
 # Even with the App token making that cascade happen for real, GitHub can take a few seconds to register the caller repo's CI check-runs against the new PR's commit at all. The "wait for CI checks" step first polls until at least one check-run has appeared against the head commit, and only then starts polling for every check-run to reach a conclusion -- skipping that first wait would read an empty check-run list as "nothing pending, nothing failed" and merge before CI ever ran.
 #
+# Both bump sites -- the dispatch handler and the heal path's regeneration -- are idempotent by version ordering, not by diff presence: pnpm add only runs when the named version is strictly above what the default branch already pins for the package (package.json's current spec across its dependency tables, range caret stripped -- the form pnpm add itself writes). A no-op guarded on diff presence catches only an exact replay; a named version below current main still diffs -- a downgrade diffs as readily as an upgrade -- and the PR it opens is a downgrade the wait-for-green gate will merge as happily as any upgrade.
+#
 # This workflow never pushes directly to main -- the PR only merges once the caller repo's own required checks genuinely pass on it, and (when branch protection is configured with required status checks) GitHub itself refuses the merge until they do, independent of this script's own polling logic being correct.
 
 on:
@@ -27,11 +29,18 @@ jobs:
         with:
           node-version: "22"
           cache: pnpm
-      - name: Bump the released dependency
+      - name: Bump the released dependency, unless main already holds it or newer
         env:
           PACKAGE: ${{ github.event.client_payload.package }}
           VERSION: ${{ github.event.client_payload.version }}
-        run: pnpm add "$PACKAGE@$VERSION"
+        run: |
+          # Idempotence guard, checked before the add: the checkout is the default branch, so main's current spec for the package is the floor, and a named version at or below it is a no-op -- equal is a replay of an already-merged bump, below is a backport published after a newer release -- because re-running pnpm add in either case still produces a diff, and the PR that diff opens sails through the wait-for-green gate as a downgrade. Compared on the bare version (range caret stripped), the spec form pnpm add itself writes; dependencies merges last so a dual-table pin resolves to the spec pnpm add will actually rewrite.
+          floor=$(jq -r --arg p "$PACKAGE" '(.devDependencies // {}) * (.optionalDependencies // {}) * (.peerDependencies // {}) * (.dependencies // {}) | .[$p] // empty' package.json | tr -d '^~')
+          if [ -n "$floor" ] && [ "$VERSION" = "$(printf '%s\n%s\n' "$floor" "$VERSION" | sort -V | head -n1)" ]; then
+            echo "main already holds ${PACKAGE}@${floor} -- ${VERSION} is at or below it. Nothing to bump."
+            exit 0
+          fi
+          pnpm add "$PACKAGE@$VERSION"
       - name: Check whether anything actually changed
         id: diff
         run: |
@@ -214,10 +223,22 @@ jobs:
 
             git fetch origin main
             git checkout -B "$branch" origin/main
+
+            # Idempotence guard, checked before the add: this checkout is fresh main, so main's current spec for the package is the floor, and a named version at or below it means the just-closed PR is obsolete -- equal is an already-merged bump replaying, below is a stale branch meeting a main that has since moved on (a coordinated migration landing a newer version of the same package). The old diff-only no-op guard caught only the equal case and waved the downgrade through to a green auto-merge -- confirmed in production on 2026-08-17, when a stale branch re-pinned a sibling schema dependency from ^3.0.0 back to ^2.7.17 and published the downgrade. The branch is deleted as well as the PR left closed: closed PRs are invisible to this job's candidate list, but a concurrently-running iteration that already captured the PR can still force-push the branch and reopen from it -- deletion removes that resurrection path entirely.
+            local floor
+            floor=$(jq -r --arg p "$package" '(.devDependencies // {}) * (.optionalDependencies // {}) * (.peerDependencies // {}) * (.dependencies // {}) | .[$p] // empty' package.json | tr -d '^~')
+            if [ -n "$floor" ] && [ "$version" = "$(printf '%s\n%s\n' "$floor" "$version" | sort -V | head -n1)" ]; then
+              echo "main already holds ${package}@${floor} -- ${version} is at or below it. Stale bump; PR stays closed."
+              git push origin --delete "$branch" || echo "::warning::could not delete stale branch ${branch} on origin"
+              return 0
+            fi
+
             pnpm add "${package}@${version}"
 
+            # Backstop for floors the ordering guard cannot see: with that guard in place, a no-diff add means the lookup missed main's spec for this package (a dependency table or range form it does not read), not that the bump is stale.
             if git diff --quiet -- package.json pnpm-lock.yaml; then
-              echo "main already has ${package}@${version} or newer -- nothing left to bump."
+              echo "add produced no diff -- main's spec for ${package} was not recognised by the floor lookup. Nothing left to bump."
+              git push origin --delete "$branch" || echo "::warning::could not delete stale branch ${branch} on origin"
               return 0
             fi
 

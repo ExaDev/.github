@@ -10,7 +10,9 @@ name: Sibling dependency instant update
 #
 # This workflow never pushes directly to main -- the PR only merges once the caller repo's own required checks genuinely pass on it, and (when branch protection is configured with required status checks) GitHub itself refuses the merge until they do, independent of this script's own polling logic being correct.
 #
-# app-id defaults to the org-wide 'exadev' App every documents.js-family caller already relies on via `secrets: inherit` (which passes AUTOMERGE_APP_PRIVATE_KEY through under that same name regardless of this input) -- passing a different app-id is for a caller authenticating as a different installed App instead (e.g. a cross-org caller outside the ExaDev org, where the org-wide App was never installed), which still needs its own AUTOMERGE_APP_PRIVATE_KEY-named secret holding that other App's key.
+# app-id defaults to the org-wide 'exadev' App every documents.js-family caller already relies on via `secrets: inherit` (which passes AUTOMERGE_APP_PRIVATE_KEY through under that same name regardless of this input) -- passing a different app-id is for a caller authenticating as a different installed App instead (e.g. a cross-org caller outside the ExaDev org, where the org-wide App was never installed).
+#
+# app-private-key is the secret holding that App's private key, for a caller whose own secret for it isn't named AUTOMERGE_APP_PRIVATE_KEY -- every existing caller leaves this unset and keeps resolving via `secrets: inherit` exactly as before, since the fallback below only takes effect when the caller passes this secret explicitly (inherit never populates a workflow_call secret under a name the caller doesn't itself have).
 #
 # workspace switches the bump mechanism from `pnpm add` against a single root package.json (every existing caller: a standalone repo, one package.json at the root) to `pnpm update --recursive` against every package.json in the tree (a caller that is itself a pnpm workspace, where the dependency can be declared in any workspace member and never at the root at all). `update` never adds a dependency nowhere already declared, which is what makes it safe to run unconditionally across every workspace member rather than needing to know in advance which one, if any, declares the package.
 
@@ -25,6 +27,10 @@ on:
         description: "Set true when the caller repo is itself a pnpm workspace, so the bump runs recursively across every member package.json instead of assuming a single root package.json."
         type: boolean
         default: false
+    secrets:
+      app-private-key:
+        description: "Private key for the App named by app-id, for a caller whose own secret isn't named AUTOMERGE_APP_PRIVATE_KEY. Optional -- every existing caller keeps resolving AUTOMERGE_APP_PRIVATE_KEY via secrets: inherit unchanged."
+        required: false
 
 permissions:
   contents: write
@@ -90,7 +96,8 @@ jobs:
         uses: actions/create-github-app-token@v2
         with:
           app-id: ${{ inputs.app-id }}
-          private-key: ${{ secrets.AUTOMERGE_APP_PRIVATE_KEY }}
+          # actionlint flags secrets.AUTOMERGE_APP_PRIVATE_KEY here as undefined, since it isn't declared under workflow_call.secrets above -- a false positive: GitHub's own reusable-workflow docs confirm a secret inherited via `secrets: inherit` at the call site stays referenceable by its original name even when not declared, which every existing caller relies on for exactly this secret.
+          private-key: ${{ secrets.app-private-key || secrets.AUTOMERGE_APP_PRIVATE_KEY }}
       - name: Commit and open a PR
         if: steps.diff.outputs.changed == 'true'
         id: pr
@@ -168,7 +175,8 @@ jobs:
         uses: actions/create-github-app-token@v2
         with:
           app-id: ${{ inputs.app-id }}
-          private-key: ${{ secrets.AUTOMERGE_APP_PRIVATE_KEY }}
+          # See the same fallback's own comment in bump-and-open-pr above -- the actionlint "undefined" warning here is the identical false positive.
+          private-key: ${{ secrets.app-private-key || secrets.AUTOMERGE_APP_PRIVATE_KEY }}
       - name: Regenerate every conflicting sibling-update PR
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}

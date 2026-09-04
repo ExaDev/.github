@@ -15,6 +15,8 @@ name: Sibling dependency instant update
 # app-private-key is the secret holding that App's private key, for a caller whose own secret for it isn't named AUTOMERGE_APP_PRIVATE_KEY -- every existing caller leaves this unset and keeps resolving via `secrets: inherit` exactly as before, since the fallback below only takes effect when the caller passes this secret explicitly (inherit never populates a workflow_call secret under a name the caller doesn't itself have).
 #
 # workspace switches the bump mechanism from `pnpm add` against a single root package.json (every existing caller: a standalone repo, one package.json at the root) to `pnpm update --recursive` against every package.json in the tree (a caller that is itself a pnpm workspace, where the dependency can be declared in any workspace member and never at the root at all). `update` never adds a dependency nowhere already declared, which is what makes it safe to run unconditionally across every workspace member rather than needing to know in advance which one, if any, declares the package.
+#
+# Neither job's setup-node step requests `cache: pnpm`: both jobs guard the actual `pnpm add`/`pnpm update` call behind an early exit (nothing to bump, or -- in heal-stranded-prs -- no stranded PR found at all, the common case on every ordinary push to main), so the pnpm store is frequently never populated. `actions/setup-node`'s pnpm cache resolves its save path from `pnpm store path` at setup time, before that store directory has necessarily been created by an actual install -- requesting the cache then fails the job's post-step with a path-validation error on every run that takes an early-exit branch, which is most of them for heal-stranded-prs specifically.
 
 on:
   workflow_call:
@@ -47,7 +49,6 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: "22"
-          cache: pnpm
       - name: Bump the released dependency, unless main already holds it or newer
         env:
           PACKAGE: ${{ github.event.client_payload.package }}
@@ -169,7 +170,6 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: "22"
-          cache: pnpm
       - name: Generate a token
         id: app-token
         uses: actions/create-github-app-token@v2

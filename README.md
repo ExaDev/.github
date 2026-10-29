@@ -1,5 +1,7 @@
 # .github
 
+[![GitHub](https://img.shields.io/badge/GitHub-181717?logo=github&logoColor=white)](https://github.com/ExaDev/.github)
+
 Org-wide GitHub configuration for [ExaDev](https://github.com/ExaDev). `profile/README.md` is the public org profile shown on [github.com/ExaDev](https://github.com/ExaDev); this file documents the repo's other contents.
 
 This repo used to also host two reusable workflows. `sync-ecosystem.yml` was a standalone `workflow_dispatch` script that kept every documents.js-family repo's dependencies on other ExaDev-published sibling packages in sync; that family has since consolidated into a single monorepo (`ExaDev/documents.js`) managing its own dependencies via pnpm workspace references, so the script is gone -- there's nothing left for it to target. `sibling-dependency-update.yml`, the `workflow_call` reusable workflow those repos' own caller stubs delegated to for the actual dependency-bump-and-heal mechanism, moved into its own dedicated repo, [`ExaDev/dependency-heal`](https://github.com/ExaDev/dependency-heal), once the documents.js family stopped needing it and its only remaining active consumer became a genuine cross-org caller.

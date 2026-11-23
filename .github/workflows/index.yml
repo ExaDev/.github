@@ -1,0 +1,28 @@
+name: Repo index
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  index:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - id: index
+        uses: ExaDev/repo-index@v1
+        with:
+          owner: ExaDev
+          output-paths: profile/README.md
+      - if: steps.index.outputs.changed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "docs: refresh repository index"
+          git pull --rebase
+          git push
